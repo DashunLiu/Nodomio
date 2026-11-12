@@ -21,7 +21,8 @@ const TAR_RECORD_BLOCKS: usize = 20;
 const MAX_DIAGNOSTIC_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_RECORD_BYTES: u64 = 1024;
 const MAX_FORMAL_CONTENT_BYTES: u64 = 512 * 1024 * 1024;
-const MAX_FORMAL_TEXT_BYTES: u64 = 64 * 1024;
+const MAX_FORMAL_SERVICE_BYTES: u64 = 64 * 1024;
+const MAX_FORMAL_LICENSE_BYTES: u64 = 1024 * 1024;
 pub(super) const FORMAL_MEMBER_COUNT: usize = 6;
 const FORMAL_MEMBERS: [(&str, u32, bool); FORMAL_MEMBER_COUNT] = [
     ("bin/nodomi-agent", 0o755, true),
@@ -98,13 +99,21 @@ pub struct FormalPackage {
     pub members: Vec<FormalPackageMember>,
 }
 
+fn formal_text_limit(path: &str) -> u64 {
+    if path == "LICENSE" {
+        MAX_FORMAL_LICENSE_BYTES
+    } else {
+        MAX_FORMAL_SERVICE_BYTES
+    }
+}
+
 pub(super) fn formal_member_lengths_valid(lengths: [u64; FORMAL_MEMBER_COUNT]) -> bool {
     let mut total = 0_u64;
-    for (length, (_, _, binary)) in lengths.into_iter().zip(FORMAL_MEMBERS) {
+    for (length, (path, _, binary)) in lengths.into_iter().zip(FORMAL_MEMBERS) {
         let allowed = if binary {
             64..=MAX_FORMAL_CONTENT_BYTES
         } else {
-            1..=MAX_FORMAL_TEXT_BYTES
+            1..=formal_text_limit(path)
         };
         if !allowed.contains(&length) {
             return false;
@@ -362,7 +371,7 @@ fn read_formal(
             }
             Some(executable)
         } else {
-            if !(1..=MAX_FORMAL_TEXT_BYTES).contains(&length) {
+            if !(1..=formal_text_limit(path)).contains(&length) {
                 return Err(InvalidTextMember);
             }
             let mut bytes = vec![0; length as usize];
@@ -586,13 +595,17 @@ mod tests {
     }
 
     fn formal_archive(elf: &[u8], text: &[u8]) -> Vec<u8> {
+        formal_archive_with_texts(elf, [text; 3])
+    }
+
+    fn formal_archive_with_texts(elf: &[u8], texts: [&[u8]; 3]) -> Vec<u8> {
         let mut archive = Vec::new();
-        for (name, mode, binary) in FORMAL_MEMBERS {
+        for (index, (name, mode, binary)) in FORMAL_MEMBERS.into_iter().enumerate() {
             entry(
                 &mut archive,
                 name.as_bytes(),
                 u64::from(mode),
-                if binary { elf } else { text },
+                if binary { elf } else { texts[index - 3] },
             );
         }
         archive.resize(archive.len() + TAR_BLOCK * 2, 0);
@@ -682,6 +695,43 @@ mod tests {
             check(&formal_archive(&wrong, b"text")),
             Err(Executable(ExecutableError::WrongPlatform))
         );
+    }
+
+    #[test]
+    fn formal_package_has_distinct_license_and_service_limits() {
+        const SERVICE_LIMIT: usize = 64 * 1024;
+        const LICENSE_LIMIT: usize = 1024 * 1024;
+        let platform = Platform::LinuxAarch64;
+        let elf = fixture_elf(platform, None);
+        let read = |texts| {
+            let package = gzip(&formal_archive_with_texts(&elf, texts));
+            inspect_formal_package(package_file(&package), platform)
+        };
+        let service = vec![b's'; SERVICE_LIMIT];
+        let license = vec![b'l'; LICENSE_LIMIT];
+        let package = read([&service, &service, &license]).unwrap();
+        let lengths = std::array::from_fn(|index| package.members[index].length);
+        assert_eq!(lengths[5], LICENSE_LIMIT as u64);
+        assert!(formal_member_lengths_valid(lengths));
+
+        let oversized_license = vec![b'l'; LICENSE_LIMIT + 1];
+        let mut invalid = lengths;
+        invalid[5] += 1;
+        assert!(!formal_member_lengths_valid(invalid));
+        assert_eq!(
+            read([&service, &service, &oversized_license]),
+            Err(PackageInspectionError::InvalidTextMember)
+        );
+
+        let oversized_service = vec![b's'; SERVICE_LIMIT + 1];
+        for index in [0, 1] {
+            let mut texts: [&[u8]; 3] = [&service, &service, &license];
+            texts[index] = &oversized_service;
+            let mut invalid = lengths;
+            invalid[index + 3] += 1;
+            assert!(!formal_member_lengths_valid(invalid));
+            assert_eq!(read(texts), Err(PackageInspectionError::InvalidTextMember));
+        }
     }
 
     #[test]

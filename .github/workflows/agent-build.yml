@@ -1,0 +1,163 @@
+name: Agent build
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Agent version in Cargo.toml
+        type: string
+        required: true
+        default: '0.1.0'
+      security_update:
+        description: Mark this release as a security update
+        type: boolean
+        required: true
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agent-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.repository == 'DashunLiu/Nodomio' && github.ref == 'refs/heads/main'
+    name: Linux ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+            machine: x86_64
+            platform: linux-x86_64
+            rust_target: x86_64-unknown-linux-musl
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+            machine: aarch64
+            platform: linux-aarch64
+            rust_target: aarch64-unknown-linux-musl
+    defaults:
+      run:
+        shell: bash
+    env:
+      AGENT_VERSION: ${{ inputs.version }}
+      SECURITY_UPDATE: ${{ inputs.security_update }}
+      PLATFORM: ${{ matrix.platform }}
+      MACHINE: ${{ matrix.machine }}
+      RUST_TARGET: ${{ matrix.rust_target }}
+      RUSTUP_TOOLCHAIN: '1.91.1'
+      CARGO_PROFILE_RELEASE_STRIP: symbols
+      CARGO_INCREMENTAL: '0'
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+      - name: Verify source and target
+        run: |
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test "$(uname -m)" = "$MACHINE"
+          python3 - <<'PY'
+          import os, re, tomllib
+          version = os.environ["AGENT_VERSION"]
+          with open("agent/Cargo.toml", "rb") as source:
+              expected = tomllib.load(source)["package"]["version"]
+          if not re.fullmatch(r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)", version) or version != expected:
+              raise SystemExit("Dispatch version differs from the Agent crate version")
+          PY
+          python3 tools/release/audit_payload.py --source .
+      - name: Prepare the pinned Rust toolchain
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends musl-tools
+          rustup toolchain install "$RUSTUP_TOOLCHAIN" --profile minimal
+          rustup target add --toolchain "$RUSTUP_TOOLCHAIN" "$RUST_TARGET"
+          rustc --version
+          cargo fetch --manifest-path agent/Cargo.toml --locked
+      - name: Test and build native static executables
+        run: |
+          cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+          export CARGO_TARGET_DIR="$RUNNER_TEMP/agent-target"
+          export RUSTFLAGS="-C linker=musl-gcc --remap-path-prefix=$GITHUB_WORKSPACE=/src --remap-path-prefix=$cargo_home=/cargo --remap-path-prefix=$RUNNER_TEMP=/build"
+          export CC=musl-gcc
+          export CFLAGS="-ffile-prefix-map=$GITHUB_WORKSPACE=/src -ffile-prefix-map=$cargo_home=/cargo -ffile-prefix-map=$RUNNER_TEMP=/build"
+          ./agent/tests/generate-loopback-tls.sh
+          cargo test --manifest-path agent/Cargo.toml --locked --offline --target "$RUST_TARGET" --jobs 3 -- --test-threads=4
+          cargo build --manifest-path agent/Cargo.toml --locked --offline --release --target "$RUST_TARGET" --jobs 3 \
+            --bin nodomi-agent --bin nodomi-agentctl --bin nodomi-agent-supervisor
+      - name: Package and verify the candidate
+        run: |
+          output="$RUNNER_TEMP/candidate"
+          license="$RUNNER_TEMP/agent-LICENSE"
+          bin_dir="$RUNNER_TEMP/agent-target/$RUST_TARGET/release"
+          name="nodomi-agent-$AGENT_VERSION-$PLATFORM"
+          python3 tools/release/license_bundle.py --target "$RUST_TARGET" --output "$license"
+          python3 tools/release/package_agent.py pack --platform "$PLATFORM" --version "$AGENT_VERSION" \
+            --bin-dir "$bin_dir" --license "$license" --output-dir "$output"
+          python3 tools/release/package_agent.py verify --platform "$PLATFORM" --version "$AGENT_VERSION" \
+            --bin-dir "$bin_dir" --license "$license" --output-dir "$output"
+          "$bin_dir/nodomi-agentctl" package inspect "$PLATFORM" "$output/$name.tar.gz" > "$RUNNER_TEMP/package-inspection.json"
+          "$bin_dir/nodomi-agent" --samples 2 --interval-ms 1000 > "$RUNNER_TEMP/diagnostic.jsonl"
+          python3 tools/release/audit_payload.py --archive "$output/$name.tar.gz"
+          python3 - "$output" "$name" "$RUNNER_TEMP" <<'PY'
+          import json, os, re, subprocess, sys
+          from pathlib import Path
+
+          output, name, scratch = Path(sys.argv[1]), sys.argv[2], Path(sys.argv[3])
+          evidence = output / (name + ".verification.json")
+          verified = json.loads(evidence.read_text())
+          samples = [json.loads(line) for line in (scratch / "diagnostic.jsonl").read_text().splitlines()]
+          if len(samples) != 2 or not all(isinstance(item, dict) for item in samples):
+              raise SystemExit("The packaged target did not emit two local diagnostic samples")
+          # Use the major/minor/patch actually exercised on this architecture.
+          kernel = re.match(r"\d+\.\d+\.\d+", subprocess.check_output(["uname", "-r"], text=True))
+          if kernel is None:
+              raise SystemExit("The exercised kernel did not report a version")
+          record = {
+              "tag": "agent-v" + os.environ["AGENT_VERSION"],
+              "commit": os.environ["GITHUB_SHA"],
+              "platform": os.environ["PLATFORM"],
+              "is_security_update": os.environ["SECURITY_UPDATE"] == "true",
+              "compatibility": {
+                  "wireProtocols": [1],
+                  "supervisorProtocols": [1],
+                  "readConfigFormats": [1],
+                  "writeConfigFormat": 1,
+                  "readQueueFormats": [1],
+                  "writeQueueFormat": 1,
+                  "minKernel": kernel.group(),
+                  "libc": "STATIC",
+                  "minLibcVersion": None,
+              },
+              "package": verified["archive"],
+          }
+          (output / "build.json").write_text(json.dumps(record, indent=2, sort_keys=True) + "\n")
+          summary = Path(os.environ["GITHUB_STEP_SUMMARY"])
+          with summary.open("a") as out:
+              out.write(f"## {record['platform']}\n\n")
+              out.write(f"Native static build, tests, package inspection, and privacy checks passed.\n\n")
+              out.write(f"Package SHA-256 `{record['package']['sha256']}`\n\n")
+              for member in verified["members"]:
+                  out.write(f"- `{member['path']}` · {member['length']} bytes · `{member['sha256']}`\n")
+          PY
+      - name: Upload audited candidate files
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nodomi-agent-publish-${{ matrix.platform }}
+          path: |
+            ${{ runner.temp }}/candidate/build.json
+            ${{ runner.temp }}/candidate/nodomi-agent-*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+          compression-level: 0
+      - name: Upload per-member verification evidence
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: nodomi-agent-evidence-${{ matrix.platform }}
+          path: ${{ runner.temp }}/candidate/nodomi-agent-*.verification.json
+          if-no-files-found: error
+          retention-days: 7

@@ -24,3 +24,9 @@ cargo test --locked
 ```
 
 The generated certificates are valid for seven days. To refresh them, remove the generated `tests/fixtures/tls/` directory and rerun the script.
+
+## Release candidates
+
+The **Agent build** GitHub Actions workflow tests and builds static Linux packages on native amd64 and arm64 runners. Each candidate includes three Agent executables, systemd and OpenRC service templates, and a bundled license file. The workflow checks the contents and uploads the package with per-file verification evidence.
+
+Publish only after reviewing both candidates from one successful run. `tools/release/publish.py` checks that run, both reviewed package digests, the exact tag and commit, and GitHub release immutability. The release manifests report the kernel version exercised for each package.
