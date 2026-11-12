@@ -1,0 +1,12 @@
+#!/sbin/openrc-run
+
+description="Nodomi Agent supervisor"
+supervisor=supervise-daemon
+command="/opt/nodomi-agent/bin/nodomi-agent-supervisor"
+command_user="root:root"
+command_args=""
+command_args_foreground=""
+retry="TERM/10/KILL/5"
+respawn_delay=2
+respawn_max=3
+respawn_period=30

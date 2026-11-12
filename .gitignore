@@ -1,0 +1,9 @@
+/agent/target/
+/agent/tests/fixtures/tls/
+__pycache__/
+*.py[cod]
+.DS_Store
+.env
+.env.*
+*.key
+*.pem

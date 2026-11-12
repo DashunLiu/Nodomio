@@ -1,0 +1,19 @@
+[Unit]
+Description=Nodomi Agent supervisor
+StartLimitIntervalSec=30s
+StartLimitBurst=3
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/opt/nodomi-agent/bin/nodomi-agent-supervisor
+StandardInput=null
+KillMode=control-group
+SendSIGKILL=yes
+TimeoutStopSec=15s
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=multi-user.target

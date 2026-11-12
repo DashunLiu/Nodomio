@@ -1,0 +1,33 @@
+[package]
+name = "nodomi-agent"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91.1"
+license = "MIT"
+publish = false
+default-run = "nodomi-agent"
+
+[dependencies]
+base64 = "=0.22.1"
+futures-channel = "=0.3.34"
+getrandom = "=0.3.4"
+libc = "=0.2.183"
+reqwest = { version = "=0.12.24", default-features = false, features = ["blocking", "rustls-tls"] }
+ring = "=0.17.14"
+rusqlite = { version = "=0.41.1", default-features = false, features = ["bundled"] }
+time = { version = "=0.3.47", features = ["formatting", "parsing"] }
+zeroize = { version = "=1.8.2", features = ["serde"] }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = { version = "=1.0.145", features = ["arbitrary_precision"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+flate2 = { version = "=1.1.11", default-features = false, features = ["miniz_oxide"] }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
+[dev-dependencies]
+tempfile = "=3.23.0"
